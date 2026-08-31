@@ -17,6 +17,7 @@ limitations under the License.
 package cache
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -163,6 +164,135 @@ func TestThreadSafeStoreIndexingFunctionsWithMultipleValues(t *testing.T) {
 	assert.NoError(compare("foo", []string{}))
 	assert.NoError(compare("bar", []string{"key2"}))
 	assert.NoError(compare("baz", []string{}))
+}
+
+type testThreadSafeStoreObject struct {
+	index string
+	value string
+}
+
+type prefixStorageCodec struct {
+	prefix string
+}
+
+func (c prefixStorageCodec) Encode(obj interface{}) (interface{}, error) {
+	stored := obj.(testThreadSafeStoreObject)
+	stored.value = c.prefix + stored.value
+	return stored, nil
+}
+
+func (c prefixStorageCodec) Decode(obj interface{}) (interface{}, error) {
+	stored := obj.(testThreadSafeStoreObject)
+	stored.value = strings.TrimPrefix(stored.value, c.prefix)
+	return stored, nil
+}
+
+func TestThreadSafeStoreStorageCodecRoundTripAndDecodedIndexing(t *testing.T) {
+	indexers := Indexers{
+		"index": func(obj interface{}) ([]string, error) {
+			return []string{obj.(testThreadSafeStoreObject).index}, nil
+		},
+	}
+
+	store := NewThreadSafeStore(indexers, Indices{}, WithThreadSafeStoreStorageCodec(prefixStorageCodec{prefix: "stored-"})).(*threadSafeMap)
+	obj := testThreadSafeStoreObject{index: "a", value: "value"}
+	store.Add("key", obj)
+
+	stored := store.items["key"].(testThreadSafeStoreObject)
+	if stored.value != "stored-value" {
+		t.Fatalf("expected encoded at-rest value, got %q", stored.value)
+	}
+
+	got, exists := store.Get("key")
+	if !exists {
+		t.Fatalf("expected item to exist")
+	}
+	if got.(testThreadSafeStoreObject) != obj {
+		t.Fatalf("unexpected decoded get result: %#v", got)
+	}
+
+	byIndex, err := store.ByIndex("index", "a")
+	if err != nil {
+		t.Fatalf("ByIndex returned error: %v", err)
+	}
+	if len(byIndex) != 1 || byIndex[0].(testThreadSafeStoreObject) != obj {
+		t.Fatalf("unexpected decoded ByIndex result: %#v", byIndex)
+	}
+
+	keys, err := store.IndexKeys("index", "a")
+	if err != nil {
+		t.Fatalf("IndexKeys returned error: %v", err)
+	}
+	if diff := cmp.Diff([]string{"key"}, keys); diff != "" {
+		t.Fatalf("unexpected index keys (-want,+got): %s", diff)
+	}
+
+	if diff := cmp.Diff([]string{"key"}, store.index.indices["index"]["a"].List()); diff != "" {
+		t.Fatalf("unexpected internal index contents (-want,+got): %s", diff)
+	}
+}
+
+func TestThreadSafeStoreDefaultGzipStorageCodecForBytes(t *testing.T) {
+	indexers := Indexers{
+		"payload": func(obj interface{}) ([]string, error) {
+			return []string{string(obj.([]byte))}, nil
+		},
+	}
+
+	payload := bytes.Repeat([]byte("compressible-data-"), 32)
+	store := NewThreadSafeStore(indexers, Indices{}).(*threadSafeMap)
+	store.Add("key", payload)
+
+	stored, ok := store.items["key"].(gzipEncodedBytes)
+	if !ok {
+		t.Fatalf("expected gzipEncodedBytes at rest, got %T", store.items["key"])
+	}
+	if len(stored.data) >= len(payload) {
+		t.Fatalf("expected compressed payload to be smaller than original, got %d >= %d", len(stored.data), len(payload))
+	}
+
+	got, exists := store.Get("key")
+	if !exists {
+		t.Fatalf("expected item to exist")
+	}
+	if diff := cmp.Diff(payload, got.([]byte)); diff != "" {
+		t.Fatalf("unexpected decoded get bytes (-want,+got): %s", diff)
+	}
+
+	indexed, err := store.ByIndex("payload", string(payload))
+	if err != nil {
+		t.Fatalf("ByIndex returned error: %v", err)
+	}
+	if len(indexed) != 1 || !bytes.Equal(payload, indexed[0].([]byte)) {
+		t.Fatalf("expected decoded indexed bytes, got %#v", indexed)
+	}
+
+	keys, err := store.IndexKeys("payload", string(payload))
+	if err != nil {
+		t.Fatalf("IndexKeys returned error: %v", err)
+	}
+	if diff := cmp.Diff([]string{"key"}, keys); diff != "" {
+		t.Fatalf("unexpected index keys (-want,+got): %s", diff)
+	}
+}
+
+func TestThreadSafeStoreDefaultGzipStorageCodecLeavesNonBytesUnchanged(t *testing.T) {
+	store := NewThreadSafeStore(Indexers{}, Indices{}).(*threadSafeMap)
+	obj := testThreadSafeStoreObject{index: "a", value: "value"}
+	store.Add("key", obj)
+
+	stored := store.items["key"]
+	if stored.(testThreadSafeStoreObject) != obj {
+		t.Fatalf("expected non-byte object to remain unchanged at rest: %#v", stored)
+	}
+
+	got, exists := store.Get("key")
+	if !exists {
+		t.Fatalf("expected item to exist")
+	}
+	if got.(testThreadSafeStoreObject) != obj {
+		t.Fatalf("unexpected get result: %#v", got)
+	}
 }
 
 func BenchmarkIndexer(b *testing.B) {
