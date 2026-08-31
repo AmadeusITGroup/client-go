@@ -17,7 +17,10 @@ limitations under the License.
 package cache
 
 import (
+	"bytes"
+	"compress/gzip"
 	"fmt"
+	"io"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -56,6 +59,68 @@ type ThreadSafeStore interface {
 	AddIndexers(newIndexers Indexers) error
 	// Resync is a no-op and is deprecated
 	Resync() error
+}
+
+// StorageCodec controls how values are stored at rest in a ThreadSafeStore.
+type StorageCodec interface {
+	Encode(obj interface{}) (interface{}, error)
+	Decode(obj interface{}) (interface{}, error)
+}
+
+type ThreadSafeStoreOption func(*threadSafeStoreOptions)
+
+type threadSafeStoreOptions struct {
+	storageCodec StorageCodec
+}
+
+// WithThreadSafeStoreStorageCodec configures how values are stored at rest in the ThreadSafeStore.
+func WithThreadSafeStoreStorageCodec(codec StorageCodec) ThreadSafeStoreOption {
+	return func(options *threadSafeStoreOptions) {
+		options.storageCodec = codec
+	}
+}
+
+type gzipEncodedBytes struct {
+	data []byte
+}
+
+type gzipStorageCodec struct{}
+
+func (gzipStorageCodec) Encode(obj interface{}) (interface{}, error) {
+	bytesObj, ok := obj.([]byte)
+	if !ok {
+		return obj, nil
+	}
+
+	var buffer bytes.Buffer
+	writer := gzip.NewWriter(&buffer)
+	if _, err := writer.Write(bytesObj); err != nil {
+		writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return gzipEncodedBytes{data: buffer.Bytes()}, nil
+}
+
+func (gzipStorageCodec) Decode(obj interface{}) (interface{}, error) {
+	encoded, ok := obj.(gzipEncodedBytes)
+	if !ok {
+		return obj, nil
+	}
+
+	reader, err := gzip.NewReader(bytes.NewReader(encoded.data))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return decoded, nil
 }
 
 // storeIndex implements the indexing functionality for Store interface
@@ -222,8 +287,9 @@ func (i *storeIndex) deleteKeyFromIndex(key, indexValue string, index Index) {
 
 // threadSafeMap implements ThreadSafeStore
 type threadSafeMap struct {
-	lock  sync.RWMutex
-	items map[string]interface{}
+	lock         sync.RWMutex
+	items        map[string]interface{}
+	storageCodec StorageCodec
 
 	// index implements the indexing functionality
 	index *storeIndex
@@ -233,18 +299,42 @@ func (c *threadSafeMap) Add(key string, obj interface{}) {
 	c.Update(key, obj)
 }
 
+func (c *threadSafeMap) encode(obj interface{}) interface{} {
+	encoded, err := c.storageCodec.Encode(obj)
+	if err != nil {
+		panic(fmt.Errorf("unable to encode value: %v", err))
+	}
+	return encoded
+}
+
+func (c *threadSafeMap) decode(obj interface{}) interface{} {
+	decoded, err := c.storageCodec.Decode(obj)
+	if err != nil {
+		panic(fmt.Errorf("unable to decode stored value: %v", err))
+	}
+	return decoded
+}
+
+func (c *threadSafeMap) decodedItem(key string) (interface{}, bool) {
+	item, exists := c.items[key]
+	if !exists {
+		return nil, false
+	}
+	return c.decode(item), true
+}
+
 func (c *threadSafeMap) Update(key string, obj interface{}) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	oldObject := c.items[key]
-	c.items[key] = obj
+	oldObject, _ := c.decodedItem(key)
+	c.items[key] = c.encode(obj)
 	c.index.updateIndices(oldObject, obj, key)
 }
 
 func (c *threadSafeMap) Delete(key string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	if obj, exists := c.items[key]; exists {
+	if obj, exists := c.decodedItem(key); exists {
 		c.index.updateIndices(obj, nil, key)
 		delete(c.items, key)
 	}
@@ -253,8 +343,7 @@ func (c *threadSafeMap) Delete(key string) {
 func (c *threadSafeMap) Get(key string) (item interface{}, exists bool) {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
-	item, exists = c.items[key]
-	return item, exists
+	return c.decodedItem(key)
 }
 
 func (c *threadSafeMap) List() []interface{} {
@@ -262,7 +351,7 @@ func (c *threadSafeMap) List() []interface{} {
 	defer c.lock.RUnlock()
 	list := make([]interface{}, 0, len(c.items))
 	for _, item := range c.items {
-		list = append(list, item)
+		list = append(list, c.decode(item))
 	}
 	return list
 }
@@ -282,11 +371,15 @@ func (c *threadSafeMap) ListKeys() []string {
 func (c *threadSafeMap) Replace(items map[string]interface{}, resourceVersion string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.items = items
+	encodedItems := make(map[string]interface{}, len(items))
+	for key, item := range items {
+		encodedItems[key] = c.encode(item)
+	}
+	c.items = encodedItems
 
 	// rebuild any index
 	c.index.reset()
-	for key, item := range c.items {
+	for key, item := range items {
 		c.index.updateIndices(nil, item, key)
 	}
 }
@@ -304,7 +397,7 @@ func (c *threadSafeMap) Index(indexName string, obj interface{}) ([]interface{},
 
 	list := make([]interface{}, 0, storeKeySet.Len())
 	for storeKey := range storeKeySet {
-		list = append(list, c.items[storeKey])
+		list = append(list, c.decode(c.items[storeKey]))
 	}
 	return list, nil
 }
@@ -320,7 +413,7 @@ func (c *threadSafeMap) ByIndex(indexName, indexedValue string) ([]interface{}, 
 	}
 	list := make([]interface{}, 0, set.Len())
 	for key := range set {
-		list = append(list, c.items[key])
+		list = append(list, c.decode(c.items[key]))
 	}
 
 	return list, nil
@@ -360,8 +453,9 @@ func (c *threadSafeMap) AddIndexers(newIndexers Indexers) error {
 
 	// If there are already items, index them
 	for key, item := range c.items {
+		decodedItem := c.decode(item)
 		for name := range newIndexers {
-			c.index.updateSingleIndex(name, nil, item, key)
+			c.index.updateSingleIndex(name, nil, decodedItem, key)
 		}
 	}
 
@@ -374,9 +468,19 @@ func (c *threadSafeMap) Resync() error {
 }
 
 // NewThreadSafeStore creates a new instance of ThreadSafeStore.
-func NewThreadSafeStore(indexers Indexers, indices Indices) ThreadSafeStore {
+func NewThreadSafeStore(indexers Indexers, indices Indices, opts ...ThreadSafeStoreOption) ThreadSafeStore {
+	options := threadSafeStoreOptions{storageCodec: gzipStorageCodec{}}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&options)
+		}
+	}
+	if options.storageCodec == nil {
+		options.storageCodec = gzipStorageCodec{}
+	}
 	return &threadSafeMap{
-		items: map[string]interface{}{},
+		items:        map[string]interface{}{},
+		storageCodec: options.storageCodec,
 		index: &storeIndex{
 			indexers: indexers,
 			indices:  indices,
